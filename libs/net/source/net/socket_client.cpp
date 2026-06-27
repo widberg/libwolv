@@ -1,9 +1,27 @@
 #include <wolv/net/socket_client.hpp>
 
+#include <cerrno>
 #include <iterator>
 #include <fcntl.h>
 
 namespace wolv::net {
+
+    namespace {
+
+        // Whether the last socket error is transient, so the read should be retried
+        // rather than treated as a disconnect: no data available yet on a non-blocking
+        // socket (EWOULDBLOCK/EAGAIN), or a call interrupted by a signal (EINTR). Any
+        // other error is treated as fatal by the caller.
+        bool shouldRetryRead() {
+            #if defined(OS_WINDOWS)
+                const auto error = ::WSAGetLastError();
+                return error == WSAEWOULDBLOCK || error == WSAEINTR;
+            #else
+                return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+            #endif
+        }
+
+    }
 
     SocketClient::SocketClient(Type type, bool blocking) : m_type(type), m_blocking(blocking) {
         initializeSockets();
@@ -88,12 +106,23 @@ namespace wolv::net {
         while (this->isConnected()) {
             u8 byte;
             auto readSize = this->readBytes(&byte, 1);
-            if (readSize < 0) {
+
+            // A return value of 0 means the peer performed an orderly shutdown, so the
+            // connection is gone and we must stop instead of spinning on further reads.
+            if (readSize == 0) {
                 m_connected = false;
                 break;
             }
-            if (readSize == 0)
-                continue;
+
+            if (readSize < 0) {
+                // Retry transient errors (no data yet on a non-blocking socket, or a
+                // signal-interrupted call); treat anything else as a real disconnect.
+                if (shouldRetryRead())
+                    continue;
+
+                m_connected = false;
+                break;
+            }
 
             if (byte == delimiter)
                 break;
